@@ -83,10 +83,10 @@ class AITrainer {
 
             // Reward Refinement: Penalize unnecessary jumps.
             // If the T-Rex was on the ground and decided to JUMP when the obstacle was far away or non-existent:
-            if (this.lastAction === 'JUMP' &&
-                this.lastState.endsWith('_on_ground') &&
+            if (this.lastAction === 'JUMP' && 
+                this.lastState.endsWith('_on_ground') && 
                 (this.lastState.startsWith('far_') || this.lastState === 'NO_OBSTACLE')) {
-                reward = -100.0; // Apply a penalty to prevent jumping without danger
+                reward = -3.0; // Softened penalty to prevent over-passivity
             }
 
             this.policy.update(this.lastState, this.lastAction, reward, currentState);
