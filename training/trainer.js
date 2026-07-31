@@ -1,20 +1,29 @@
 import { GameAdapter } from '../infrastructure/game-adapter.js';
 import { discretizeState } from '../domain/discretizer.js';
 import { QLearningPolicy } from '../application/q-learning-policy.js';
+import { GeneticEvolution } from '../application/genetic-policy.js';
 
 class AITrainer {
     constructor() {
         this.adapter = new GameAdapter();
+        
+        // Algorithm mode: 'q-learning' or 'genetic'
+        this.algorithm = 'q-learning';
+
+        // Q-Learning policy
         this.policy = new QLearningPolicy({
             learningRate: 0.15,
             discountFactor: 0.90,
-            epsilon: 0.2, // Start with some exploration
+            epsilon: 0.5,
             actions: ['NONE', 'JUMP', 'DUCK']
         });
 
+        // Genetic / Neuroevolution policy
+        this.genetic = new GeneticEvolution(10, 0.15); // 10 agents per generation, 15% mutation rate
+
         // Training parameters
-        this.epsilonDecay = 0.995;
-        this.minEpsilon = 0.001;
+        this.epsilonDecay = 0.998;
+        this.minEpsilon = 0.01;
         this.episodeCount = 0;
         this.highestScore = 0;
         this.scores = [];
@@ -22,8 +31,10 @@ class AITrainer {
         // Loop state
         this.lastState = null;
         this.lastAction = null;
+        this.lastObstacleRef = null;
         this.isTrainingActive = false;
         this.isReplayMode = false;
+        this.accumulatedReward = 0;
 
         // Load saved progress if exists
         this.loadProgress();
@@ -36,6 +47,8 @@ class AITrainer {
         this.isTrainingActive = true;
         this.lastState = null;
         this.lastAction = null;
+        this.lastObstacleRef = null;
+        this.accumulatedReward = 0;
         this.updateUI();
         this.loop();
     }
@@ -57,10 +70,11 @@ class AITrainer {
 
         // Check if game is not started or ready
         if (!this.adapter.isPlaying()) {
-            // Auto start if training is active
             this.adapter.reset();
             this.lastState = null;
             this.lastAction = null;
+            this.lastObstacleRef = null;
+            this.accumulatedReward = 0;
             requestAnimationFrame(() => this.loop());
             return;
         }
@@ -71,76 +85,129 @@ class AITrainer {
             return;
         }
 
-        // Update real-time stats on UI
+        // Update real-time score display
         this.updateLiveStats(rawState.score);
 
-        const currentState = discretizeState(rawState);
-
-        // Update Q-value for the previous step if it exists (only if not in replay mode)
-        if (!this.isReplayMode && this.lastState && this.lastAction) {
-            // Base reward for surviving a frame
-            let reward = 1.0;
-
-            // Reward Refinement: Penalize unnecessary jumps.
-            // If the T-Rex was on the ground and decided to JUMP when the obstacle was far away or non-existent:
-            if (this.lastAction === 'JUMP' && 
-                this.lastState.endsWith('_on_ground') && 
-                (this.lastState.startsWith('far_') || this.lastState === 'NO_OBSTACLE')) {
-                reward = -3.0; // Softened penalty to prevent over-passivity
-            }
-
-            this.policy.update(this.lastState, this.lastAction, reward, currentState);
+        if (this.algorithm === 'q-learning') {
+            this.runQLearningStep(rawState);
+        } else if (this.algorithm === 'genetic') {
+            this.runGeneticStep(rawState);
         }
-
-        // Choose next action. Replay mode uses the best learned action (exploitation only)
-        const action = this.isReplayMode
-            ? this.policy.getBestAction(currentState)
-            : this.policy.selectAction(currentState);
-
-        this.adapter.applyAction(action);
-
-        this.lastState = currentState;
-        this.lastAction = action;
 
         requestAnimationFrame(() => this.loop());
     }
 
-    handleGameOver() {
-        if (!this.isReplayMode && this.lastState && this.lastAction) {
-            // Negative reward for colliding
-            const reward = -1000.0;
-            this.policy.update(this.lastState, this.lastAction, reward, 'CRASHED');
-        }
+    runQLearningStep(rawState) {
+        const currentState = discretizeState(rawState);
 
-        // Get final score to record
+        // Frame reward calculations
+        let frameReward = 0.1;
+        
+        if (this.lastObstacleRef && this.lastObstacleRef !== rawState.nextObstacle) {
+            frameReward = 20.0;
+        }
+        this.lastObstacleRef = rawState.nextObstacle;
+        this.accumulatedReward += frameReward;
+
+        if (currentState !== this.lastState) {
+            if (!this.isReplayMode && this.lastState && this.lastAction) {
+                if (this.lastAction === 'JUMP' && 
+                    this.lastState.endsWith('_on_ground') && 
+                    (this.lastState.startsWith('far_') || this.lastState === 'NO_OBSTACLE')) {
+                    this.accumulatedReward -= 5.0;
+                }
+                this.policy.update(this.lastState, this.lastAction, this.accumulatedReward, currentState);
+            }
+
+            this.accumulatedReward = 0;
+
+            const action = this.isReplayMode
+                ? this.policy.getBestAction(currentState)
+                : this.policy.selectAction(currentState);
+            
+            this.adapter.applyAction(action);
+
+            this.lastState = currentState;
+            this.lastAction = action;
+        } else if (this.lastAction) {
+            this.adapter.applyAction(this.lastAction);
+        }
+    }
+
+    runGeneticStep(rawState) {
+        const agent = this.genetic.getCurrentAgent();
+        const tRex = rawState.tRex;
+        const obs = rawState.nextObstacle;
+
+        // Neural Network inputs (normalized 0.0 to 1.0)
+        const inputs = [
+            obs ? Math.min(1.0, (obs.x - tRex.x) / 600) : 1.0, // Distance
+            obs ? Math.min(1.0, obs.width / 100) : 0,         // Width
+            obs ? Math.min(1.0, obs.height / 100) : 0,        // Height
+            obs ? Math.min(1.0, obs.y / 150) : 0,             // Obstacle Y pos
+            Math.min(1.0, rawState.gameSpeed / 20),           // Game speed
+            Math.min(1.0, tRex.y / 150)                       // T-Rex Y position (air status)
+        ];
+
+        const outputs = agent.brain.predict(inputs);
+
+        // Map output activations to action
+        // Output indexes: 0 = NONE, 1 = JUMP, 2 = DUCK
+        const maxIndex = outputs.indexOf(Math.max(...outputs));
+        const actions = ['NONE', 'JUMP', 'DUCK'];
+        const action = actions[maxIndex];
+
+        this.adapter.applyAction(action);
+        this.lastAction = action;
+    }
+
+    handleGameOver() {
         const rawState = this.adapter.readRawState();
         const finalScore = rawState ? rawState.score : 0;
 
-        // Save score to history
-        this.scores.push(finalScore);
+        if (this.algorithm === 'q-learning') {
+            if (!this.isReplayMode && this.lastState && this.lastAction) {
+                const reward = this.accumulatedReward - 1000.0;
+                this.policy.update(this.lastState, this.lastAction, reward, 'CRASHED');
+            }
 
-        if (finalScore > this.highestScore) {
-            this.highestScore = finalScore;
-        }
+            this.scores.push(finalScore);
 
-        this.episodeCount++;
+            if (finalScore > this.highestScore) {
+                this.highestScore = finalScore;
+            }
 
-        // Decay exploration rate (only when training)
-        if (!this.isReplayMode) {
-            this.policy.epsilon = Math.max(this.minEpsilon, this.policy.epsilon * this.epsilonDecay);
+            this.episodeCount++;
 
-            // Auto save periodically
-            if (this.episodeCount % 5 === 0) {
+            if (!this.isReplayMode) {
+                this.policy.epsilon = Math.max(this.minEpsilon, this.policy.epsilon * this.epsilonDecay);
+                if (this.episodeCount % 5 === 0) {
+                    this.saveProgress();
+                }
+            }
+        } else if (this.algorithm === 'genetic') {
+            // Register fitness score for current agent and check if generation is complete
+            const isNewGen = this.genetic.registerScore(finalScore);
+
+            this.scores.push(finalScore);
+
+            if (finalScore > this.highestScore) {
+                this.highestScore = finalScore;
+            }
+
+            if (isNewGen) {
                 this.saveProgress();
             }
         }
 
         this.lastState = null;
         this.lastAction = null;
+        this.lastObstacleRef = null;
+        this.accumulatedReward = 0;
 
         this.updateUI();
 
-        // Delay reset slightly so the user can see game over state
+        // Delay reset slightly to let the user see the crash
         setTimeout(() => {
             if (this.isTrainingActive && this.adapter.isGameOver()) {
                 this.adapter.reset();
@@ -149,37 +216,77 @@ class AITrainer {
     }
 
     saveProgress() {
+        localStorage.setItem('trex_algo', this.algorithm);
+        localStorage.setItem('trex_highscore', this.highestScore.toString());
+        localStorage.setItem('trex_scores', JSON.stringify(this.scores));
+
+        // Save Q-learning parameters
         localStorage.setItem('trex_qtable', this.policy.exportTable());
         localStorage.setItem('trex_episodes', this.episodeCount.toString());
-        localStorage.setItem('trex_highscore', this.highestScore.toString());
         localStorage.setItem('trex_epsilon', this.policy.epsilon.toString());
-        localStorage.setItem('trex_scores', JSON.stringify(this.scores));
+
+        // Save Genetic parameters
+        localStorage.setItem('trex_generation', this.genetic.generation.toString());
+        localStorage.setItem('trex_agent_idx', this.genetic.currentAgentIndex.toString());
+        localStorage.setItem('trex_population', JSON.stringify(this.genetic.population.map(p => ({
+            weights1: p.brain.weights1,
+            weights2: p.brain.weights2,
+            bias1: p.brain.bias1,
+            bias2: p.brain.bias2,
+            fitness: p.fitness
+        }))));
     }
 
     loadProgress() {
+        const algo = localStorage.getItem('trex_algo');
+        const highscore = localStorage.getItem('trex_highscore');
+        const savedScores = localStorage.getItem('trex_scores');
+
+        if (algo) this.algorithm = algo;
+        if (highscore) this.highestScore = parseInt(highscore, 10);
+        if (savedScores) this.scores = JSON.parse(savedScores);
+
+        // Load Q-learning properties
         const qtable = localStorage.getItem('trex_qtable');
         const episodes = localStorage.getItem('trex_episodes');
-        const highscore = localStorage.getItem('trex_highscore');
         const epsilon = localStorage.getItem('trex_epsilon');
-        const savedScores = localStorage.getItem('trex_scores');
 
         if (qtable) this.policy.importTable(qtable);
         if (episodes) this.episodeCount = parseInt(episodes, 10);
-        if (highscore) this.highestScore = parseInt(highscore, 10);
         if (epsilon) this.policy.epsilon = parseFloat(epsilon);
-        if (savedScores) this.scores = JSON.parse(savedScores);
+
+        // Load Genetic properties
+        const gen = localStorage.getItem('trex_generation');
+        const agentIdx = localStorage.getItem('trex_agent_idx');
+        const popData = localStorage.getItem('trex_population');
+
+        if (gen) this.genetic.generation = parseInt(gen, 10);
+        if (agentIdx) this.genetic.currentAgentIndex = parseInt(agentIdx, 10);
+        if (popData) {
+            const list = JSON.parse(popData);
+            this.genetic.population = list.map(item => ({
+                brain: new NeuralNetwork(6, 6, 3, 
+                    { w1: item.weights1, w2: item.weights2 }, 
+                    { b1: item.bias1, b2: item.bias2 }
+                ),
+                fitness: item.fitness
+            }));
+        }
     }
 
     resetBrain() {
-        if (confirm('Are you sure you want to reset all AI learning?')) {
-            localStorage.removeItem('trex_qtable');
-            localStorage.removeItem('trex_episodes');
-            localStorage.removeItem('trex_highscore');
-            localStorage.removeItem('trex_epsilon');
-            localStorage.removeItem('trex_scores');
+        if (confirm('Are you sure you want to reset all AI progress?')) {
+            localStorage.clear();
+            
+            // Re-instantiate policies
+            this.policy = new QLearningPolicy({
+                learningRate: 0.15,
+                discountFactor: 0.90,
+                epsilon: 0.5,
+                actions: ['NONE', 'JUMP', 'DUCK']
+            });
+            this.genetic = new GeneticEvolution(10, 0.15);
 
-            this.policy.qTable = {};
-            this.policy.epsilon = 0.2;
             this.episodeCount = 0;
             this.highestScore = 0;
             this.scores = [];
@@ -188,7 +295,6 @@ class AITrainer {
     }
 
     initUI() {
-        // Create container
         const container = document.createElement('div');
         container.id = 'ai-dashboard';
         container.style.cssText = `
@@ -202,26 +308,26 @@ class AITrainer {
             font-family: monospace;
             font-size: 12px;
             z-index: 9999;
-            width: 250px;
+            width: 255px;
         `;
 
         container.innerHTML = `
-            <div><b>T-Rex AI (Q-Learning)</b></div>
+            <div><b>T-Rex AI Brain</b></div>
             <div>Status: <span id="ai-status-badge">INACTIVE</span></div>
-            <div>Mode: <span id="ui-mode-badge">TRAIN</span></div>
+            <div>Algo: <span id="ui-algo-badge" style="font-weight: bold;">Q-LEARNING</span></div>
+            <div id="ui-mode-row">Mode: <span id="ui-mode-badge">TRAIN</span></div>
             <hr/>
-            <div>Episodes: <span id="ui-episodes">0</span></div>
-            <div>Q-Table size: <span id="ui-states">0</span></div>
-            <div>Epsilon: <span id="ui-epsilon">0.0%</span></div>
-            <div>High Score: <span id="ui-highscore">0</span></div>
-            <div>Score: <span id="ui-current-score">0</span></div>
+            <div id="ui-stats-container">
+                <!-- Dynamically populated stats -->
+            </div>
             <hr/>
             <div id="ui-chart" style="line-height: 1.2; font-size: 11px;"></div>
             <hr/>
-            <button id="btn-toggle-ai">Start Training</button>
+            <button id="btn-toggle-ai">Start</button>
+            <button id="btn-toggle-algo">Switch Algorithm</button>
             <button id="btn-toggle-mode">Toggle Mode</button>
             <button id="btn-reset-ai">Reset</button>
-            <button id="btn-save-ai">Export JSON</button>
+            <button id="btn-save-ai">Export Best</button>
         `;
 
         document.body.appendChild(container);
@@ -235,17 +341,33 @@ class AITrainer {
             }
         });
 
+        document.getElementById('btn-toggle-algo').addEventListener('click', () => {
+            this.stop();
+            this.algorithm = this.algorithm === 'q-learning' ? 'genetic' : 'q-learning';
+            this.saveProgress();
+            this.updateUI();
+        });
+
         document.getElementById('btn-toggle-mode').addEventListener('click', () => {
             this.isReplayMode = !this.isReplayMode;
             this.updateUI();
         });
 
         document.getElementById('btn-reset-ai').addEventListener('click', () => this.resetBrain());
+        
         document.getElementById('btn-save-ai').addEventListener('click', () => {
-            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(this.policy.exportTable());
+            let dataStr;
+            let filename;
+            if (this.algorithm === 'q-learning') {
+                dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(this.policy.exportTable());
+                filename = `qtable_ep_${this.episodeCount}.json`;
+            } else {
+                dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(this.genetic.exportBestBrain());
+                filename = `neuro_best_gen_${this.genetic.generation}.json`;
+            }
             const downloadAnchor = document.createElement('a');
             downloadAnchor.setAttribute("href", dataStr);
-            downloadAnchor.setAttribute("download", `qtable_episode_${this.episodeCount}.json`);
+            downloadAnchor.setAttribute("download", filename);
             document.body.appendChild(downloadAnchor);
             downloadAnchor.click();
             downloadAnchor.remove();
@@ -257,8 +379,11 @@ class AITrainer {
     updateUI() {
         const statusBadge = document.getElementById('ai-status-badge');
         const btnToggle = document.getElementById('btn-toggle-ai');
+        const algoBadge = document.getElementById('ui-algo-badge');
         const modeBadge = document.getElementById('ui-mode-badge');
         const btnToggleMode = document.getElementById('btn-toggle-mode');
+        const uiModeRow = document.getElementById('ui-mode-row');
+        const statsContainer = document.getElementById('ui-stats-container');
 
         if (this.isTrainingActive) {
             statusBadge.innerText = 'ACTIVE';
@@ -270,27 +395,52 @@ class AITrainer {
             btnToggle.innerText = 'Start';
         }
 
-        if (this.isReplayMode) {
-            modeBadge.innerText = 'REPLAY (Exploit)';
-            modeBadge.style.color = 'blue';
-            btnToggleMode.innerText = 'Switch to Train';
-        } else {
-            modeBadge.innerText = 'TRAIN (Exploring)';
-            modeBadge.style.color = 'darkorange';
-            btnToggleMode.innerText = 'Switch to Replay';
-        }
+        if (this.algorithm === 'q-learning') {
+            algoBadge.innerText = 'Q-LEARNING';
+            algoBadge.style.color = 'purple';
+            uiModeRow.style.display = 'block';
+            btnToggleMode.style.display = 'inline-block';
 
-        document.getElementById('ui-episodes').innerText = this.episodeCount;
-        document.getElementById('ui-states').innerText = this.policy.getQTableSize();
-        document.getElementById('ui-epsilon').innerText = `${(this.policy.epsilon * 100).toFixed(1)}%`;
-        document.getElementById('ui-highscore').innerText = this.highestScore;
+            if (this.isReplayMode) {
+                modeBadge.innerText = 'REPLAY (Exploit)';
+                modeBadge.style.color = 'blue';
+                btnToggleMode.innerText = 'Switch to Train';
+            } else {
+                modeBadge.innerText = 'TRAIN (Exploring)';
+                modeBadge.style.color = 'darkorange';
+                btnToggleMode.innerText = 'Switch to Replay';
+            }
+
+            statsContainer.innerHTML = `
+                <div>Episodes: <span id="ui-episodes">${this.episodeCount}</span></div>
+                <div>Q-Table size: <span id="ui-states">${this.policy.getQTableSize()}</span></div>
+                <div>Epsilon: <span id="ui-epsilon">${(this.policy.epsilon * 100).toFixed(1)}%</span></div>
+                <div>High Score: <span id="ui-highscore">${this.highestScore}</span></div>
+                <div>Score: <span id="ui-current-score">0</span></div>
+            `;
+        } else {
+            algoBadge.innerText = 'NEUROEVOLUTION';
+            algoBadge.style.color = 'teal';
+            uiModeRow.style.display = 'none';
+            btnToggleMode.style.display = 'none';
+
+            statsContainer.innerHTML = `
+                <div>Generation: <span id="ui-generation">${this.genetic.generation}</span></div>
+                <div>Dino Index: <span id="ui-agent-idx">${this.genetic.currentAgentIndex + 1}/${this.genetic.populationSize}</span></div>
+                <div>Mutation: <span id="ui-mutation">${(this.genetic.mutationRate * 100).toFixed(0)}%</span></div>
+                <div>High Score: <span id="ui-highscore">${this.highestScore}</span></div>
+                <div>Score: <span id="ui-current-score">0</span></div>
+            `;
+        }
 
         this.updateChart();
     }
 
     updateLiveStats(score) {
         document.getElementById('ui-current-score').innerText = score;
-        document.getElementById('ui-states').innerText = this.policy.getQTableSize();
+        if (this.algorithm === 'q-learning') {
+            document.getElementById('ui-states').innerText = this.policy.getQTableSize();
+        }
     }
 
     updateChart() {
@@ -317,7 +467,7 @@ class AITrainer {
         const maxAvg = Math.max(...averages.map(a => a.avg), 100);
 
         let chartHtml = '<b>Evolution (avg of 10 eps):</b><br/>';
-        const recentAverages = averages.slice(-5); // Show last 5 blocks
+        const recentAverages = averages.slice(-5);
         for (const item of recentAverages) {
             const barCount = Math.max(1, Math.min(maxBarLength, Math.round((item.avg / maxAvg) * maxBarLength)));
             const barStr = '█'.repeat(barCount) + '░'.repeat(maxBarLength - barCount);
