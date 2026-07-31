@@ -1,29 +1,29 @@
 import { GameAdapter } from '../infrastructure/game-adapter.js';
 import { discretizeState } from '../domain/discretizer.js';
 import { QLearningPolicy } from '../application/q-learning-policy.js';
-import { GeneticEvolution } from '../application/genetic-policy.js';
+import { GeneticEvolution, NeuralNetwork } from '../application/genetic-policy.js';
 
 class AITrainer {
     constructor() {
         this.adapter = new GameAdapter();
-        
+
         // Algorithm mode: 'q-learning' or 'genetic'
         this.algorithm = 'q-learning';
 
         // Q-Learning policy
         this.policy = new QLearningPolicy({
-            learningRate: 0.15,
-            discountFactor: 0.90,
+            learningRate: 0.25,
+            discountFactor: 0.95,
             epsilon: 0.5,
             actions: ['NONE', 'JUMP', 'DUCK']
         });
 
         // Genetic / Neuroevolution policy
-        this.genetic = new GeneticEvolution(10, 0.15); // 10 agents per generation, 15% mutation rate
+        this.genetic = new GeneticEvolution(50, 0.15); // 10 agents per generation, 15% mutation rate
 
         // Training parameters
-        this.epsilonDecay = 0.998;
-        this.minEpsilon = 0.01;
+        this.epsilonDecay = 0.9995;
+        this.minEpsilon = 0.05;
         this.episodeCount = 0;
         this.highestScore = 0;
         this.scores = [];
@@ -31,10 +31,10 @@ class AITrainer {
         // Loop state
         this.lastState = null;
         this.lastAction = null;
-        this.lastObstacleRef = null;
+        this.lastObstacleX = null;
         this.isTrainingActive = false;
         this.isReplayMode = false;
-        this.accumulatedReward = 0;
+        this.currentAgentFitness = 0;
 
         // Load saved progress if exists
         this.loadProgress();
@@ -47,8 +47,8 @@ class AITrainer {
         this.isTrainingActive = true;
         this.lastState = null;
         this.lastAction = null;
-        this.lastObstacleRef = null;
-        this.accumulatedReward = 0;
+        this.lastObstacleX = null;
+        this.currentAgentFitness = 0;
         this.updateUI();
         this.loop();
     }
@@ -73,8 +73,8 @@ class AITrainer {
             this.adapter.reset();
             this.lastState = null;
             this.lastAction = null;
-            this.lastObstacleRef = null;
-            this.accumulatedReward = 0;
+            this.lastObstacleX = null;
+            this.currentAgentFitness = 0;
             requestAnimationFrame(() => this.loop());
             return;
         }
@@ -100,65 +100,107 @@ class AITrainer {
     runQLearningStep(rawState) {
         const currentState = discretizeState(rawState);
 
-        // Frame reward calculations
-        let frameReward = 0.1;
-        
-        if (this.lastObstacleRef && this.lastObstacleRef !== rawState.nextObstacle) {
-            frameReward = 20.0;
+        // Detect obstacle clearance by tracking X position
+        const currentObsX = rawState.nextObstacle ? rawState.nextObstacle.x : null;
+        let clearedObstacle = false;
+        if (this.lastObstacleX !== null) {
+            if (currentObsX === null || currentObsX > this.lastObstacleX + 50) {
+                clearedObstacle = true;
+            }
         }
-        this.lastObstacleRef = rawState.nextObstacle;
-        this.accumulatedReward += frameReward;
+        this.lastObstacleX = currentObsX;
 
+        // Only act on state transitions — one clean reward per transition
         if (currentState !== this.lastState) {
             if (!this.isReplayMode && this.lastState && this.lastAction) {
-                if (this.lastAction === 'JUMP' && 
-                    this.lastState.endsWith('_on_ground') && 
-                    (this.lastState.startsWith('far_') || this.lastState === 'NO_OBSTACLE')) {
-                    this.accumulatedReward -= 5.0;
-                }
-                this.policy.update(this.lastState, this.lastAction, this.accumulatedReward, currentState);
-            }
+                // Clean per-transition reward (NOT accumulated over frames)
+                let reward = 0.1; // Small survival reward per transition
 
-            this.accumulatedReward = 0;
+                if (clearedObstacle) {
+                    reward = 5.0; // Successfully cleared an obstacle
+                }
+
+                // Penalize jumping when far from obstacles
+                if (this.lastAction === 'JUMP' &&
+                    this.lastState.endsWith('_ground') &&
+                    (this.lastState.startsWith('far_') || this.lastState === 'NO_OBSTACLE')) {
+                    reward = -1.0;
+                }
+
+                this.policy.update(this.lastState, this.lastAction, reward, currentState);
+            }
 
             const action = this.isReplayMode
                 ? this.policy.getBestAction(currentState)
                 : this.policy.selectAction(currentState);
-            
+
             this.adapter.applyAction(action);
 
             this.lastState = currentState;
             this.lastAction = action;
-        } else if (this.lastAction) {
-            this.adapter.applyAction(this.lastAction);
+        } else if (this.lastAction === 'DUCK') {
+            // Only re-apply DUCK (needs to be held down).
+            this.adapter.applyAction('DUCK');
         }
     }
 
     runGeneticStep(rawState) {
-        const agent = this.genetic.getCurrentAgent();
-        const tRex = rawState.tRex;
-        const obs = rawState.nextObstacle;
+        const currentState = discretizeState(rawState);
 
-        // Neural Network inputs (normalized 0.0 to 1.0)
-        const inputs = [
-            obs ? Math.min(1.0, (obs.x - tRex.x) / 600) : 1.0, // Distance
-            obs ? Math.min(1.0, obs.width / 100) : 0,         // Width
-            obs ? Math.min(1.0, obs.height / 100) : 0,        // Height
-            obs ? Math.min(1.0, obs.y / 150) : 0,             // Obstacle Y pos
-            Math.min(1.0, rawState.gameSpeed / 20),           // Game speed
-            Math.min(1.0, tRex.y / 150)                       // T-Rex Y position (air status)
-        ];
+        // Detect obstacle clearance
+        const currentObsX = rawState.nextObstacle ? rawState.nextObstacle.x : null;
+        let clearedObstacle = false;
+        if (this.lastObstacleX !== null) {
+            if (currentObsX === null || currentObsX > this.lastObstacleX + 50) {
+                clearedObstacle = true;
+            }
+        }
+        this.lastObstacleX = currentObsX;
 
-        const outputs = agent.brain.predict(inputs);
+        // Survival reward accumulated during the run
+        this.currentAgentFitness += 0.1;
 
-        // Map output activations to action
-        // Output indexes: 0 = NONE, 1 = JUMP, 2 = DUCK
-        const maxIndex = outputs.indexOf(Math.max(...outputs));
-        const actions = ['NONE', 'JUMP', 'DUCK'];
-        const action = actions[maxIndex];
+        if (clearedObstacle) {
+            this.currentAgentFitness += 20.0; // Bonus for clearing obstacle
+        }
 
-        this.adapter.applyAction(action);
-        this.lastAction = action;
+        if (currentState !== this.lastState) {
+            const agent = this.genetic.getCurrentAgent();
+            const tRex = rawState.tRex;
+            const obs = rawState.nextObstacle;
+
+            // Neural Network inputs (normalized 0.0 to 1.0)
+            const inputs = [
+                obs ? Math.min(1.0, (obs.x - tRex.x) / 600) : 1.0, // Distance
+                obs ? Math.min(1.0, obs.width / 100) : 0,         // Width
+                obs ? Math.min(1.0, obs.height / 100) : 0,        // Height
+                obs ? Math.min(1.0, obs.y / 150) : 0,             // Obstacle Y pos
+                Math.min(1.0, rawState.gameSpeed / 20),           // Game speed
+                Math.min(1.0, tRex.y / 150)                       // T-Rex Y position (air status)
+            ];
+
+            const outputs = agent.brain.predict(inputs);
+
+            // Map output activations to action
+            // Output indexes: 0 = NONE, 1 = JUMP, 2 = DUCK
+            const maxIndex = outputs.indexOf(Math.max(...outputs));
+            const actions = ['NONE', 'JUMP', 'DUCK'];
+            const action = actions[maxIndex];
+
+            // Penalize unnecessary jumping
+            if (action === 'JUMP' && 
+                currentState.endsWith('_ground') && 
+                (currentState.startsWith('far_') || currentState === 'NO_OBSTACLE')) {
+                this.currentAgentFitness -= 2.0;
+            }
+
+            this.adapter.applyAction(action);
+            this.lastState = currentState;
+            this.lastAction = action;
+        } else if (this.lastAction === 'DUCK') {
+            // Only re-apply DUCK (needs to be held down).
+            this.adapter.applyAction('DUCK');
+        }
     }
 
     handleGameOver() {
@@ -167,8 +209,8 @@ class AITrainer {
 
         if (this.algorithm === 'q-learning') {
             if (!this.isReplayMode && this.lastState && this.lastAction) {
-                const reward = this.accumulatedReward - 1000.0;
-                this.policy.update(this.lastState, this.lastAction, reward, 'CRASHED');
+                // Clean death penalty — same scale as transition rewards
+                this.policy.update(this.lastState, this.lastAction, -10.0, 'CRASHED');
             }
 
             this.scores.push(finalScore);
@@ -186,8 +228,12 @@ class AITrainer {
                 }
             }
         } else if (this.algorithm === 'genetic') {
+            // Penalize crash and register fitness
+            this.currentAgentFitness -= 10.0;
+            const finalFitness = Math.max(0.1, this.currentAgentFitness + finalScore);
+
             // Register fitness score for current agent and check if generation is complete
-            const isNewGen = this.genetic.registerScore(finalScore);
+            const isNewGen = this.genetic.registerScore(finalFitness);
 
             this.scores.push(finalScore);
 
@@ -202,8 +248,8 @@ class AITrainer {
 
         this.lastState = null;
         this.lastAction = null;
-        this.lastObstacleRef = null;
-        this.accumulatedReward = 0;
+        this.lastObstacleX = null;
+        this.currentAgentFitness = 0;
 
         this.updateUI();
 
@@ -265,31 +311,33 @@ class AITrainer {
         if (popData) {
             const list = JSON.parse(popData);
             this.genetic.population = list.map(item => ({
-                brain: new NeuralNetwork(6, 6, 3, 
-                    { w1: item.weights1, w2: item.weights2 }, 
+                brain: new NeuralNetwork(6, 6, 3,
+                    { w1: item.weights1, w2: item.weights2 },
                     { b1: item.bias1, b2: item.bias2 }
                 ),
                 fitness: item.fitness
             }));
+            this.genetic.populationSize = this.genetic.population.length;
         }
     }
 
     resetBrain() {
         if (confirm('Are you sure you want to reset all AI progress?')) {
             localStorage.clear();
-            
+
             // Re-instantiate policies
             this.policy = new QLearningPolicy({
-                learningRate: 0.15,
-                discountFactor: 0.90,
+                learningRate: 0.25,
+                discountFactor: 0.95,
                 epsilon: 0.5,
                 actions: ['NONE', 'JUMP', 'DUCK']
             });
-            this.genetic = new GeneticEvolution(10, 0.15);
+            this.genetic = new GeneticEvolution(50, 0.15);
 
             this.episodeCount = 0;
             this.highestScore = 0;
             this.scores = [];
+            this.currentAgentFitness = 0;
             this.updateUI();
         }
     }
@@ -354,7 +402,7 @@ class AITrainer {
         });
 
         document.getElementById('btn-reset-ai').addEventListener('click', () => this.resetBrain());
-        
+
         document.getElementById('btn-save-ai').addEventListener('click', () => {
             let dataStr;
             let filename;
