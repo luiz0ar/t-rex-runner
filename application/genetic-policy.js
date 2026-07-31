@@ -84,6 +84,28 @@ export class NeuralNetwork {
         this.bias2 = this.bias2.map(mutateVal);
     }
 
+    /**
+     * Performs uniform crossover between this network and a partner network.
+     * @param {NeuralNetwork} partner
+     * @returns {NeuralNetwork} A new child network
+     */
+    crossover(partner) {
+        const child = new NeuralNetwork(this.inputNodes, this.hiddenNodes, this.outputNodes);
+        
+        child.weights1 = this.weights1.map((row, i) => 
+            row.map((val, j) => Math.random() < 0.5 ? val : partner.weights1[i][j])
+        );
+
+        child.weights2 = this.weights2.map((row, i) => 
+            row.map((val, j) => Math.random() < 0.5 ? val : partner.weights2[i][j])
+        );
+
+        child.bias1 = this.bias1.map((val, i) => Math.random() < 0.5 ? val : partner.bias1[i]);
+        child.bias2 = this.bias2.map((val, i) => Math.random() < 0.5 ? val : partner.bias2[i]);
+
+        return child;
+    }
+
     clone() {
         return new NeuralNetwork(
             this.inputNodes,
@@ -100,7 +122,7 @@ export class GeneticEvolution {
      * @param {number} populationSize - Number of agents per generation
      * @param {number} mutationRate - Probability of mutation
      */
-    constructor(populationSize = 10, mutationRate = 0.1) {
+    constructor(populationSize = 50, mutationRate = 0.15) {
         this.populationSize = populationSize;
         this.mutationRate = mutationRate;
         
@@ -145,23 +167,27 @@ export class GeneticEvolution {
         // Sort population by fitness descending
         this.population.sort((a, b) => b.fitness - a.fitness);
 
-        // Keep top 2 best performers (Elitism)
-        const bestPerformers = [
-            this.population[0].brain.clone(),
-            this.population[1].brain.clone()
-        ];
+        // Keep top 10% best performers (Elitism, minimum 1)
+        const elitesCount = Math.max(1, Math.floor(this.populationSize * 0.1));
+        const bestBrains = this.population.slice(0, elitesCount).map(p => p.brain.clone());
 
         const newPopulation = [];
 
         // Add elites directly
-        newPopulation.push({ brain: bestPerformers[0].clone(), fitness: 0 });
-        newPopulation.push({ brain: bestPerformers[1].clone(), fitness: 0 });
+        for (let i = 0; i < elitesCount; i++) {
+            newPopulation.push({ brain: bestBrains[i].clone(), fitness: 0 });
+        }
 
-        // Generate offspring via replication and mutation
-        for (let i = 2; i < this.populationSize; i++) {
-            // Select parent (weighted towards best performers)
-            const parentBrain = Math.random() < 0.7 ? bestPerformers[0] : bestPerformers[1];
-            const childBrain = parentBrain.clone();
+        // Generate offspring via crossover and mutation
+        for (let i = elitesCount; i < this.populationSize; i++) {
+            // Select two parents randomly from elites
+            const parentA = bestBrains[Math.floor(Math.random() * bestBrains.length)];
+            const parentB = bestBrains[Math.floor(Math.random() * bestBrains.length)];
+            
+            // Perform crossover
+            const childBrain = parentA.crossover(parentB);
+            
+            // Perform mutation
             childBrain.mutate(this.mutationRate);
 
             newPopulation.push({ brain: childBrain, fitness: 0 });
