@@ -169,14 +169,23 @@ class AITrainer {
             const tRex = rawState.tRex;
             const obs = rawState.nextObstacle;
 
-            // Neural Network inputs (normalized 0.0 to 1.0)
+            // Speed-invariant and properly normalized inputs
+            const tRexFront = tRex.x + 44;
+            const obsDistance = obs ? obs.x - tRexFront : 600;
+            // timeToCollision: 0.0 means immediate collision, 1.0 means far/safe (based on speed-normalized frames, max 25 frames)
+            const timeToCollision = obs ? Math.max(0.0, Math.min(1.0, obsDistance / (rawState.gameSpeed * 25))) : 1.0;
+            // obstacleHeightAboveGround: normalized height of the obstacle (useful for birds Y pos vs cacti ground level)
+            const obstacleHeightAboveGround = obs ? Math.max(0.0, Math.min(1.0, (tRex.groundY - obs.y) / 100)) : 0.0;
+            // tRexHeightAboveGround: 0.0 on ground, goes up to 1.0 when high in jump
+            const tRexHeightAboveGround = Math.max(0.0, Math.min(1.0, (tRex.groundY - tRex.y) / 100));
+
             const inputs = [
-                obs ? Math.min(1.0, (obs.x - tRex.x) / 600) : 1.0, // Distance
-                obs ? Math.min(1.0, obs.width / 100) : 0,         // Width
-                obs ? Math.min(1.0, obs.height / 100) : 0,        // Height
-                obs ? Math.min(1.0, obs.y / 150) : 0,             // Obstacle Y pos
-                Math.min(1.0, rawState.gameSpeed / 20),           // Game speed
-                Math.min(1.0, tRex.y / 150)                       // T-Rex Y position (air status)
+                timeToCollision,                                 // Speed-invariant distance
+                obs ? Math.min(1.0, obs.width / 100) : 0.0,      // Width
+                obs ? Math.min(1.0, obs.height / 100) : 0.0,     // Height
+                obstacleHeightAboveGround,                       // Height of obstacle above ground (detects birds)
+                Math.min(1.0, rawState.gameSpeed / 20),          // Game speed
+                tRexHeightAboveGround                            // T-Rex height above ground (jump state)
             ];
 
             const outputs = agent.brain.predict(inputs);
