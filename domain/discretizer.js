@@ -5,10 +5,10 @@
 
 /**
  * Discretizes a raw state object into a unique string key representing a state.
- * Refines buckets and explicitly incorporates speed categories to account for jump physics.
+ * Uses obstacle height, jump phase, speed, and time-to-collision distance.
  * 
  * @param {Object} rawState - Raw state returned by GameAdapter.readRawState()
- * @returns {string} The discretized state key (e.g. "d3_medium_ground_low_on_ground")
+ * @returns {string} The discretized state key (e.g. "d1_medium_cactus_large_ground")
  */
 export function discretizeState(rawState) {
     if (!rawState) return 'NO_STATE';
@@ -19,7 +19,6 @@ export function discretizeState(rawState) {
         return 'NO_OBSTACLE';
     }
 
-    // T-Rex width is 44, START_X_POS is 50.
     // Calculate distance from T-Rex's front edge to the obstacle's front edge.
     const tRexFront = tRex.x + 44;
     const distance = nextObstacle.x - tRexFront;
@@ -27,31 +26,23 @@ export function discretizeState(rawState) {
     // Normalize distance by speed to get a proxy for time-to-collision (in frames).
     const normalizedDistance = distance / gameSpeed;
 
-    // Discretize distance with higher precision (smaller intervals)
+    // Distance buckets — 5 levels for faster Q-table convergence
     let distBucket;
     if (normalizedDistance < 0) {
         distBucket = 'passed';
-    } else if (normalizedDistance < 3) {
-        distBucket = 'd0';
-    } else if (normalizedDistance < 6) {
-        distBucket = 'd1';
-    } else if (normalizedDistance < 9) {
-        distBucket = 'd2';
-    } else if (normalizedDistance < 12) {
-        distBucket = 'd3';
-    } else if (normalizedDistance < 16) {
-        distBucket = 'd4';
-    } else if (normalizedDistance < 20) {
-        distBucket = 'd5';
-    } else if (normalizedDistance < 25) {
-        distBucket = 'd6';
+    } else if (normalizedDistance < 4) {
+        distBucket = 'd0';  // Critical — must already be acting
+    } else if (normalizedDistance < 8) {
+        distBucket = 'd1';  // Jump now
+    } else if (normalizedDistance < 14) {
+        distBucket = 'd2';  // Approaching
+    } else if (normalizedDistance < 22) {
+        distBucket = 'd3';  // Getting close
     } else {
         distBucket = 'far';
     }
 
-    // Discretize speed because T-Rex jump duration (air time) is constant.
-    // At higher speeds, the T-Rex travels much further horizontally during a jump,
-    // requiring the jump to start at a different normalized distance.
+    // Speed bucket — affects jump arc horizontal distance
     let speedBucket;
     if (gameSpeed < 8) {
         speedBucket = 'slow';
@@ -63,8 +54,8 @@ export function discretizeState(rawState) {
         speedBucket = 'hyper';
     }
 
-    // Discretize obstacle type / vertical position
-    let obsBucket = 'ground_low';
+    // Obstacle type with height differentiation for cacti
+    let obsBucket;
     if (nextObstacle.type === 'PTERODACTYL') {
         const y = nextObstacle.y;
         if (y <= 50) {
@@ -74,10 +65,27 @@ export function discretizeState(rawState) {
         } else {
             obsBucket = 'bird_low';
         }
+    } else {
+        // Cactus — small cacti need different jump timing than large
+        if (nextObstacle.height <= 35) {
+            obsBucket = 'cactus_small';
+        } else {
+            obsBucket = 'cactus_large';
+        }
     }
 
-    // T-Rex vertical state
-    const airBucket = tRex.jumping ? 'in_air' : 'on_ground';
+    // T-Rex vertical state — 4 phases for precise jump arc awareness
+    let airBucket;
+    if (tRex.ducking) {
+        airBucket = 'ducking';
+    } else if (!tRex.jumping) {
+        airBucket = 'ground';
+    } else if (tRex.y > tRex.groundY - 20) {
+        // Near ground level while jumping (just took off or about to land)
+        airBucket = 'low_air';
+    } else {
+        airBucket = 'high_air';
+    }
 
     return `${distBucket}_${speedBucket}_${obsBucket}_${airBucket}`;
 }
