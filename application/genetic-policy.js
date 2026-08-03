@@ -1,10 +1,29 @@
 /**
- * Simple Neural Network and Genetic Algorithm Policy for Neuroevolution.
- * Allows the T-Rex to learn using a feedforward neural network mutated over generations.
+ * Neural Network and Genetic Algorithm Policy for Neuroevolution in T-Rex Runner.
+ * Features:
+ * - Multi-layer Feedforward Neural Network (6 inputs -> 8 hidden -> 8 hidden -> 3 outputs)
+ * - Tanh hidden activations and Sigmoid output activations
+ * - Elitism, Uniform Crossover, and Gaussian Mutation
+ * - Tournament Selection to prevent inbreeding and preserve population diversity
  */
 
+function gaussianRandom(mean = 0, stdev = 1) {
+    let u = 0, v = 0;
+    while (u === 0) u = Math.random();
+    while (v === 0) v = Math.random();
+    const num = Math.sqrt(-2.0 * Math.log(u)) * Math.cos(2.0 * Math.PI * v);
+    return num * stdev + mean;
+}
+
 export class NeuralNetwork {
-    constructor(inputNodes, hiddenNodes, outputNodes, weights = null, biases = null) {
+    /**
+     * @param {number} inputNodes 
+     * @param {number} hiddenNodes 
+     * @param {number} outputNodes 
+     * @param {Object} [weights] 
+     * @param {Object} [biases] 
+     */
+    constructor(inputNodes = 6, hiddenNodes = 8, outputNodes = 3, weights = null, biases = null) {
         this.inputNodes = inputNodes;
         this.hiddenNodes = hiddenNodes;
         this.outputNodes = outputNodes;
@@ -12,53 +31,73 @@ export class NeuralNetwork {
         if (weights && biases) {
             this.weights1 = JSON.parse(JSON.stringify(weights.w1));
             this.weights2 = JSON.parse(JSON.stringify(weights.w2));
+            this.weights3 = JSON.parse(JSON.stringify(weights.w3));
             this.bias1 = JSON.parse(JSON.stringify(biases.b1));
             this.bias2 = JSON.parse(JSON.stringify(biases.b2));
+            this.bias3 = JSON.parse(JSON.stringify(biases.b3));
         } else {
-            // Random initialization between -1.0 and 1.0
+            // Xavier / Glorot-like random initialization
+            const initScale1 = Math.sqrt(2 / (this.inputNodes + this.hiddenNodes));
+            const initScale2 = Math.sqrt(2 / (this.hiddenNodes + this.hiddenNodes));
+            const initScale3 = Math.sqrt(2 / (this.hiddenNodes + this.outputNodes));
+
             this.weights1 = Array.from({ length: this.hiddenNodes }, () =>
-                Array.from({ length: this.inputNodes }, () => Math.random() * 2 - 1)
+                Array.from({ length: this.inputNodes }, () => gaussianRandom(0, initScale1))
             );
-            this.weights2 = Array.from({ length: this.outputNodes }, () =>
-                Array.from({ length: this.hiddenNodes }, () => Math.random() * 2 - 1)
+            this.weights2 = Array.from({ length: this.hiddenNodes }, () =>
+                Array.from({ length: this.hiddenNodes }, () => gaussianRandom(0, initScale2))
             );
-            this.bias1 = Array.from({ length: this.hiddenNodes }, () => Math.random() * 2 - 1);
-            this.bias2 = Array.from({ length: this.outputNodes }, () => Math.random() * 2 - 1);
+            this.weights3 = Array.from({ length: this.outputNodes }, () =>
+                Array.from({ length: this.hiddenNodes }, () => gaussianRandom(0, initScale3))
+            );
+
+            this.bias1 = Array.from({ length: this.hiddenNodes }, () => 0);
+            this.bias2 = Array.from({ length: this.hiddenNodes }, () => 0);
+            this.bias3 = Array.from({ length: this.outputNodes }, () => 0);
         }
     }
 
-    /**
-     * Sigmoid activation function.
-     */
+    _tanh(x) {
+        return Math.tanh(x);
+    }
+
     _sigmoid(x) {
         return 1 / (1 + Math.exp(-x));
     }
 
     /**
-     * Feeds inputs forward through the network.
-     * @param {Array<number>} inputs
-     * @returns {Array<number>} Outputs
+     * Feeds inputs forward through the 2-hidden layer network.
+     * @param {Array<number>} inputs 
+     * @returns {Array<number>} Outputs [NONE, JUMP, DUCK]
      */
     predict(inputs) {
-        // Hidden layer activations
-        const hidden = [];
+        // Hidden Layer 1 (Tanh)
+        const h1 = [];
         for (let i = 0; i < this.hiddenNodes; i++) {
-            let sum = 0;
+            let sum = this.bias1[i];
             for (let j = 0; j < this.inputNodes; j++) {
                 sum += inputs[j] * this.weights1[i][j];
             }
-            sum += this.bias1[i];
-            hidden.push(this._sigmoid(sum));
+            h1.push(this._tanh(sum));
         }
 
-        // Output layer activations
+        // Hidden Layer 2 (Tanh)
+        const h2 = [];
+        for (let i = 0; i < this.hiddenNodes; i++) {
+            let sum = this.bias2[i];
+            for (let j = 0; j < this.hiddenNodes; j++) {
+                sum += h1[j] * this.weights2[i][j];
+            }
+            h2.push(this._tanh(sum));
+        }
+
+        // Output Layer (Sigmoid)
         const outputs = [];
         for (let i = 0; i < this.outputNodes; i++) {
-            let sum = 0;
+            let sum = this.bias3[i];
             for (let j = 0; j < this.hiddenNodes; j++) {
-                sum += hidden[j] * this.weights2[i][j];
+                sum += h2[j] * this.weights3[i][j];
             }
-            sum += this.bias2[i];
             outputs.push(this._sigmoid(sum));
         }
 
@@ -66,42 +105,47 @@ export class NeuralNetwork {
     }
 
     /**
-     * Mutates weights and biases using a mutation rate.
-     * @param {number} rate - Mutation rate (e.g. 0.1)
+     * Mutates weights and biases using Gaussian noise.
+     * @param {number} rate - Probability of mutating a parameter
+     * @param {number} strength - Standard deviation of Gaussian noise
      */
-    mutate(rate) {
+    mutate(rate = 0.10, strength = 0.20) {
         const mutateVal = (val) => {
             if (Math.random() < rate) {
-                // Add a small Gaussian-like random change
-                return val + (Math.random() * 2 - 1) * 0.5;
+                return val + gaussianRandom(0, strength);
             }
             return val;
         };
 
         this.weights1 = this.weights1.map(row => row.map(mutateVal));
         this.weights2 = this.weights2.map(row => row.map(mutateVal));
+        this.weights3 = this.weights3.map(row => row.map(mutateVal));
         this.bias1 = this.bias1.map(mutateVal);
         this.bias2 = this.bias2.map(mutateVal);
+        this.bias3 = this.bias3.map(mutateVal);
     }
 
     /**
-     * Performs uniform crossover between this network and a partner network.
-     * @param {NeuralNetwork} partner
-     * @returns {NeuralNetwork} A new child network
+     * Uniform crossover with a partner network.
+     * @param {NeuralNetwork} partner 
+     * @returns {NeuralNetwork}
      */
     crossover(partner) {
         const child = new NeuralNetwork(this.inputNodes, this.hiddenNodes, this.outputNodes);
-        
-        child.weights1 = this.weights1.map((row, i) => 
+
+        child.weights1 = this.weights1.map((row, i) =>
             row.map((val, j) => Math.random() < 0.5 ? val : partner.weights1[i][j])
         );
-
-        child.weights2 = this.weights2.map((row, i) => 
+        child.weights2 = this.weights2.map((row, i) =>
             row.map((val, j) => Math.random() < 0.5 ? val : partner.weights2[i][j])
+        );
+        child.weights3 = this.weights3.map((row, i) =>
+            row.map((val, j) => Math.random() < 0.5 ? val : partner.weights3[i][j])
         );
 
         child.bias1 = this.bias1.map((val, i) => Math.random() < 0.5 ? val : partner.bias1[i]);
         child.bias2 = this.bias2.map((val, i) => Math.random() < 0.5 ? val : partner.bias2[i]);
+        child.bias3 = this.bias3.map((val, i) => Math.random() < 0.5 ? val : partner.bias3[i]);
 
         return child;
     }
@@ -111,45 +155,49 @@ export class NeuralNetwork {
             this.inputNodes,
             this.hiddenNodes,
             this.outputNodes,
-            { w1: this.weights1, w2: this.weights2 },
-            { b1: this.bias1, b2: this.bias2 }
+            { w1: this.weights1, w2: this.weights2, w3: this.weights3 },
+            { b1: this.bias1, b2: this.bias2, b3: this.bias3 }
         );
     }
 }
 
 export class GeneticEvolution {
     /**
-     * @param {number} populationSize - Number of agents per generation
-     * @param {number} mutationRate - Probability of mutation
+     * @param {number} populationSize 
+     * @param {number} mutationRate 
+     * @param {number} mutationStrength 
      */
-    constructor(populationSize = 50, mutationRate = 0.15) {
+    constructor(populationSize = 50, mutationRate = 0.10, mutationStrength = 0.20) {
         this.populationSize = populationSize;
         this.mutationRate = mutationRate;
-        
+        this.mutationStrength = mutationStrength;
+
         this.generation = 1;
         this.currentAgentIndex = 0;
-        
+        this.generationBestFitness = 0;
+
         // Initialize population
         this.population = Array.from({ length: this.populationSize }, () => ({
-            brain: new NeuralNetwork(6, 6, 3), // 6 inputs, 6 hidden nodes, 3 outputs (NONE, JUMP, DUCK)
+            brain: new NeuralNetwork(6, 8, 3),
             fitness: 0
         }));
     }
 
-    /**
-     * Get the currently active agent.
-     */
     getCurrentAgent() {
         return this.population[this.currentAgentIndex];
     }
 
     /**
-     * Register fitness score for the current agent and advance.
-     * @param {number} score
-     * @returns {boolean} True if a new generation has started.
+     * Registers fitness score for the current agent.
+     * @param {number} score 
+     * @returns {boolean} True if a new generation started.
      */
     registerScore(score) {
         this.population[this.currentAgentIndex].fitness = score;
+        if (score > this.generationBestFitness) {
+            this.generationBestFitness = score;
+        }
+
         this.currentAgentIndex++;
 
         if (this.currentAgentIndex >= this.populationSize) {
@@ -161,52 +209,68 @@ export class GeneticEvolution {
     }
 
     /**
-     * Breed and mutate the next generation of agents based on fitness.
+     * Selects a candidate using Tournament Selection (k = tournamentSize).
+     * Maintains healthy selection pressure while preserving population diversity.
+     * @param {Array<Object>} pop 
+     * @param {number} tournamentSize 
+     * @returns {NeuralNetwork}
+     */
+    tournamentSelect(pop, tournamentSize = 3) {
+        let best = null;
+        for (let i = 0; i < tournamentSize; i++) {
+            const randomIndex = Math.floor(Math.random() * pop.length);
+            const candidate = pop[randomIndex];
+            if (!best || candidate.fitness > best.fitness) {
+                best = candidate;
+            }
+        }
+        return best.brain;
+    }
+
+    /**
+     * Breeds the next generation of agents.
      */
     evolve() {
-        // Sort population by fitness descending
+        // Sort population descending by fitness
         this.population.sort((a, b) => b.fitness - a.fitness);
 
-        // Keep top 10% best performers (Elitism, minimum 1)
-        const elitesCount = Math.max(1, Math.floor(this.populationSize * 0.1));
-        const bestBrains = this.population.slice(0, elitesCount).map(p => p.brain.clone());
+        // Keep top 10% as elites (minimum 2)
+        const elitesCount = Math.max(2, Math.floor(this.populationSize * 0.10));
+        const elites = this.population.slice(0, elitesCount).map(p => p.brain.clone());
 
         const newPopulation = [];
 
-        // Add elites directly
+        // 1. Add Elites directly without mutation
         for (let i = 0; i < elitesCount; i++) {
-            newPopulation.push({ brain: bestBrains[i].clone(), fitness: 0 });
+            newPopulation.push({ brain: elites[i].clone(), fitness: 0 });
         }
 
-        // Generate offspring via crossover and mutation
+        // 2. Breed remaining population via Tournament Selection + Crossover + Gaussian Mutation
         for (let i = elitesCount; i < this.populationSize; i++) {
-            // Select two parents randomly from elites
-            const parentA = bestBrains[Math.floor(Math.random() * bestBrains.length)];
-            const parentB = bestBrains[Math.floor(Math.random() * bestBrains.length)];
-            
-            // Perform crossover
+            const parentA = this.tournamentSelect(this.population, 3);
+            const parentB = this.tournamentSelect(this.population, 3);
+
             const childBrain = parentA.crossover(parentB);
-            
-            // Perform mutation
-            childBrain.mutate(this.mutationRate);
+            childBrain.mutate(this.mutationRate, this.mutationStrength);
 
             newPopulation.push({ brain: childBrain, fitness: 0 });
         }
 
         this.population = newPopulation;
+        this.generationBestFitness = 0;
         this.generation++;
     }
 
-    /**
-     * Export the best brain as a JSON string.
-     */
     exportBestBrain() {
-        const best = this.population.sort((a, b) => b.fitness - a.fitness)[0];
+        const sorted = [...this.population].sort((a, b) => b.fitness - a.fitness);
+        const best = sorted[0];
         return JSON.stringify({
             weights1: best.brain.weights1,
             weights2: best.brain.weights2,
+            weights3: best.brain.weights3,
             bias1: best.brain.bias1,
-            bias2: best.brain.bias2
+            bias2: best.bias2,
+            bias3: best.bias3
         });
     }
 }

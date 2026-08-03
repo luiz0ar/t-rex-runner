@@ -1,39 +1,21 @@
 import { GameAdapter } from '../infrastructure/game-adapter.js';
-import { discretizeState } from '../domain/discretizer.js';
-import { QLearningPolicy } from '../application/q-learning-policy.js';
-import { GeneticEvolution, NeuralNetwork } from '../application/genetic-policy.js';
+import { GeneticEvolution } from '../application/genetic-policy.js';
 
 class AITrainer {
     constructor() {
         this.adapter = new GameAdapter();
 
-        // Algorithm mode: 'q-learning' or 'genetic'
-        this.algorithm = 'q-learning';
+        // Neuroevolution policy: 50 population, 10% mutation rate, 0.20 noise strength
+        this.genetic = new GeneticEvolution(50, 0.10, 0.20);
 
-        // Q-Learning policy
-        this.policy = new QLearningPolicy({
-            learningRate: 0.25,
-            discountFactor: 0.95,
-            epsilon: 0.5,
-            actions: ['NONE', 'JUMP', 'DUCK']
-        });
-
-        // Genetic / Neuroevolution policy
-        this.genetic = new GeneticEvolution(50, 0.15); // 10 agents per generation, 15% mutation rate
-
-        // Training parameters
-        this.epsilonDecay = 0.9995;
-        this.minEpsilon = 0.05;
-        this.episodeCount = 0;
+        // Training stats
         this.highestScore = 0;
         this.scores = [];
+        this.generationAverages = [];
 
         // Loop state
-        this.lastState = null;
-        this.lastAction = null;
         this.lastObstacleX = null;
         this.isTrainingActive = false;
-        this.isReplayMode = false;
         this.currentAgentFitness = 0;
 
         // Load saved progress if exists
@@ -45,8 +27,6 @@ class AITrainer {
 
     start() {
         this.isTrainingActive = true;
-        this.lastState = null;
-        this.lastAction = null;
         this.lastObstacleX = null;
         this.currentAgentFitness = 0;
         this.updateUI();
@@ -71,8 +51,6 @@ class AITrainer {
         // Check if game is not started or ready
         if (!this.adapter.isPlaying()) {
             this.adapter.reset();
-            this.lastState = null;
-            this.lastAction = null;
             this.lastObstacleX = null;
             this.currentAgentFitness = 0;
             requestAnimationFrame(() => this.loop());
@@ -88,197 +66,115 @@ class AITrainer {
         // Update real-time score display
         this.updateLiveStats(rawState.score);
 
-        if (this.algorithm === 'q-learning') {
-            this.runQLearningStep(rawState);
-        } else if (this.algorithm === 'genetic') {
-            this.runGeneticStep(rawState);
-        }
+        // Run continuous 60 FPS Neuroevolution step
+        this.runGeneticStep(rawState);
 
         requestAnimationFrame(() => this.loop());
     }
 
-    runQLearningStep(rawState) {
-        const currentState = discretizeState(rawState);
-
-        // Detect obstacle clearance by tracking X position
-        const currentObsX = rawState.nextObstacle ? rawState.nextObstacle.x : null;
-        let clearedObstacle = false;
-        if (this.lastObstacleX !== null) {
-            if (currentObsX === null || currentObsX > this.lastObstacleX + 50) {
-                clearedObstacle = true;
-            }
-        }
-        this.lastObstacleX = currentObsX;
-
-        // Only act on state transitions — one clean reward per transition
-        if (currentState !== this.lastState) {
-            if (!this.isReplayMode && this.lastState && this.lastAction) {
-                // Clean per-transition reward (NOT accumulated over frames)
-                let reward = 0.1; // Small survival reward per transition
-
-                if (clearedObstacle) {
-                    reward = 5.0; // Successfully cleared an obstacle
-                }
-
-                // Penalize jumping when far from obstacles
-                if (this.lastAction === 'JUMP' &&
-                    this.lastState.endsWith('_ground') &&
-                    (this.lastState.startsWith('far_') || this.lastState === 'NO_OBSTACLE')) {
-                    reward = -1.0;
-                }
-
-                this.policy.update(this.lastState, this.lastAction, reward, currentState);
-            }
-
-            const action = this.isReplayMode
-                ? this.policy.getBestAction(currentState)
-                : this.policy.selectAction(currentState);
-
-            this.adapter.applyAction(action);
-
-            this.lastState = currentState;
-            this.lastAction = action;
-        } else if (this.lastAction === 'DUCK') {
-            // Only re-apply DUCK (needs to be held down).
-            this.adapter.applyAction('DUCK');
-        }
-    }
-
+    /**
+     * Continuous 60 FPS evaluation of the Neural Network.
+     * Receives raw game state and applies controls on every frame.
+     * @param {Object} rawState 
+     */
     runGeneticStep(rawState) {
-        const currentState = discretizeState(rawState);
+        const { tRex, nextObstacle, gameSpeed } = rawState;
+        const agent = this.genetic.getCurrentAgent();
 
-        // Detect obstacle clearance
-        const currentObsX = rawState.nextObstacle ? rawState.nextObstacle.x : null;
+        // Detect obstacle clearance by tracking obstacle X position
+        const currentObsX = nextObstacle ? nextObstacle.x : null;
         let clearedObstacle = false;
         if (this.lastObstacleX !== null) {
-            if (currentObsX === null || currentObsX > this.lastObstacleX + 50) {
+            if (currentObsX === null || currentObsX > this.lastObstacleX + 40) {
                 clearedObstacle = true;
             }
         }
         this.lastObstacleX = currentObsX;
 
-        // Survival reward accumulated during the run
+        // Fitness accumulation: continuous survival reward + obstacle clearance bonus
         this.currentAgentFitness += 0.1;
-
         if (clearedObstacle) {
-            this.currentAgentFitness += 20.0; // Bonus for clearing obstacle
+            this.currentAgentFitness += 25.0; // Bonus for successfully passing an obstacle
         }
 
-        if (currentState !== this.lastState) {
-            const agent = this.genetic.getCurrentAgent();
-            const tRex = rawState.tRex;
-            const obs = rawState.nextObstacle;
+        // Calculate smooth continuous inputs normalized between [0, 1]
+        const tRexFront = tRex.x + 44;
+        const obsDistance = nextObstacle ? Math.max(0, nextObstacle.x - tRexFront) : 800;
+        
+        // timeToCollision: 0.0 = collision point, 1.0 = safe distance (speed-adjusted)
+        const timeToCollision = nextObstacle ? Math.max(0.0, Math.min(1.0, obsDistance / (gameSpeed * 25))) : 1.0;
+        
+        // obstacleY: height of obstacle above ground (0.0 = low cactus/bird, up to 1.0 = high bird)
+        const obstacleY = nextObstacle ? Math.max(0.0, Math.min(1.0, (tRex.groundY - nextObstacle.y) / 100)) : 0.0;
+        
+        // tRexY: height of T-Rex above ground (0.0 = ground level, 1.0 = top of jump)
+        const tRexY = Math.max(0.0, Math.min(1.0, (tRex.groundY - tRex.y) / 100));
 
-            // Speed-invariant and properly normalized inputs
-            const tRexFront = tRex.x + 44;
-            const obsDistance = obs ? obs.x - tRexFront : 600;
-            // timeToCollision: 0.0 means immediate collision, 1.0 means far/safe (based on speed-normalized frames, max 25 frames)
-            const timeToCollision = obs ? Math.max(0.0, Math.min(1.0, obsDistance / (rawState.gameSpeed * 25))) : 1.0;
-            // obstacleHeightAboveGround: normalized height of the obstacle (useful for birds Y pos vs cacti ground level)
-            const obstacleHeightAboveGround = obs ? Math.max(0.0, Math.min(1.0, (tRex.groundY - obs.y) / 100)) : 0.0;
-            // tRexHeightAboveGround: 0.0 on ground, goes up to 1.0 when high in jump
-            const tRexHeightAboveGround = Math.max(0.0, Math.min(1.0, (tRex.groundY - tRex.y) / 100));
+        const inputs = [
+            timeToCollision,                                       // Input 0: Time to collision
+            nextObstacle ? Math.min(1.0, nextObstacle.width / 100) : 0.0, // Input 1: Obstacle width
+            nextObstacle ? Math.min(1.0, nextObstacle.height / 100) : 0.0,// Input 2: Obstacle height
+            obstacleY,                                             // Input 3: Obstacle Y position
+            Math.min(1.0, gameSpeed / 25),                         // Input 4: Game speed
+            tRexY                                                  // Input 5: T-Rex Y position
+        ];
 
-            const inputs = [
-                timeToCollision,                                 // Speed-invariant distance
-                obs ? Math.min(1.0, obs.width / 100) : 0.0,      // Width
-                obs ? Math.min(1.0, obs.height / 100) : 0.0,     // Height
-                obstacleHeightAboveGround,                       // Height of obstacle above ground (detects birds)
-                Math.min(1.0, rawState.gameSpeed / 20),          // Game speed
-                tRexHeightAboveGround                            // T-Rex height above ground (jump state)
-            ];
+        // Feed forward prediction (Outputs: 0 = NONE, 1 = JUMP, 2 = DUCK)
+        const outputs = agent.brain.predict(inputs);
+        const maxIndex = outputs.indexOf(Math.max(...outputs));
+        const actions = ['NONE', 'JUMP', 'DUCK'];
+        const action = actions[maxIndex];
 
-            const outputs = agent.brain.predict(inputs);
-
-            // Map output activations to action
-            // Output indexes: 0 = NONE, 1 = JUMP, 2 = DUCK
-            const maxIndex = outputs.indexOf(Math.max(...outputs));
-            const actions = ['NONE', 'JUMP', 'DUCK'];
-            const action = actions[maxIndex];
-
-            // Penalize unnecessary jumping
-            if (action === 'JUMP' && 
-                currentState.endsWith('_ground') && 
-                (currentState.startsWith('far_') || currentState === 'NO_OBSTACLE')) {
-                this.currentAgentFitness -= 2.0;
-            }
-
-            this.adapter.applyAction(action);
-            this.lastState = currentState;
-            this.lastAction = action;
-        } else if (this.lastAction === 'DUCK') {
-            // Only re-apply DUCK (needs to be held down).
-            this.adapter.applyAction('DUCK');
+        // Small penalty for unnecessary jump spam when obstacles are far away
+        if (action === 'JUMP' && tRexY === 0 && timeToCollision > 0.8) {
+            this.currentAgentFitness -= 0.5;
         }
+
+        // Apply control action to game
+        this.adapter.applyAction(action);
     }
 
     handleGameOver() {
         const rawState = this.adapter.readRawState();
         const finalScore = rawState ? rawState.score : 0;
 
-        if (this.algorithm === 'q-learning') {
-            if (!this.isReplayMode && this.lastState && this.lastAction) {
-                // Clean death penalty — same scale as transition rewards
-                this.policy.update(this.lastState, this.lastAction, -10.0, 'CRASHED');
-            }
+        // Calculate final fitness score combining distance ran and obstacle bonuses
+        const finalFitness = Math.max(0.1, this.currentAgentFitness + finalScore * 1.5);
 
-            this.scores.push(finalScore);
+        // Register fitness and check if generation completed
+        const isNewGen = this.genetic.registerScore(finalFitness);
 
-            if (finalScore > this.highestScore) {
-                this.highestScore = finalScore;
-            }
-
-            this.episodeCount++;
-
-            if (!this.isReplayMode) {
-                this.policy.epsilon = Math.max(this.minEpsilon, this.policy.epsilon * this.epsilonDecay);
-                if (this.episodeCount % 5 === 0) {
-                    this.saveProgress();
-                }
-            }
-        } else if (this.algorithm === 'genetic') {
-            // Penalize crash and register fitness
-            this.currentAgentFitness -= 10.0;
-            const finalFitness = Math.max(0.1, this.currentAgentFitness + finalScore);
-
-            // Register fitness score for current agent and check if generation is complete
-            const isNewGen = this.genetic.registerScore(finalFitness);
-
-            this.scores.push(finalScore);
-
-            if (finalScore > this.highestScore) {
-                this.highestScore = finalScore;
-            }
-
-            if (isNewGen) {
-                this.saveProgress();
-            }
+        this.scores.push(finalScore);
+        if (finalScore > this.highestScore) {
+            this.highestScore = finalScore;
         }
 
-        this.lastState = null;
-        this.lastAction = null;
+        if (isNewGen) {
+            // Track generation average score
+            const genChunk = this.scores.slice(-this.genetic.populationSize);
+            const genAvg = Math.round(genChunk.reduce((a, b) => a + b, 0) / genChunk.length);
+            this.generationAverages.push(genAvg);
+
+            this.saveProgress();
+        }
+
         this.lastObstacleX = null;
         this.currentAgentFitness = 0;
 
         this.updateUI();
 
-        // Delay reset slightly to let the user see the crash
+        // Restart game after short delay
         setTimeout(() => {
             if (this.isTrainingActive && this.adapter.isGameOver()) {
                 this.adapter.reset();
             }
-        }, 800);
+        }, 500);
     }
 
     saveProgress() {
-        localStorage.setItem('trex_algo', this.algorithm);
         localStorage.setItem('trex_highscore', this.highestScore.toString());
         localStorage.setItem('trex_scores', JSON.stringify(this.scores));
-
-        // Save Q-learning parameters
-        localStorage.setItem('trex_qtable', this.policy.exportTable());
-        localStorage.setItem('trex_episodes', this.episodeCount.toString());
-        localStorage.setItem('trex_epsilon', this.policy.epsilon.toString());
+        localStorage.setItem('trex_gen_avgs', JSON.stringify(this.generationAverages));
 
         // Save Genetic parameters
         localStorage.setItem('trex_generation', this.genetic.generation.toString());
@@ -286,29 +182,22 @@ class AITrainer {
         localStorage.setItem('trex_population', JSON.stringify(this.genetic.population.map(p => ({
             weights1: p.brain.weights1,
             weights2: p.brain.weights2,
-            bias1: p.brain.bias1,
-            bias2: p.brain.bias2,
+            weights3: p.brain.weights3,
+            bias1: p.bias1,
+            bias2: p.bias2,
+            bias3: p.bias3,
             fitness: p.fitness
         }))));
     }
 
     loadProgress() {
-        const algo = localStorage.getItem('trex_algo');
         const highscore = localStorage.getItem('trex_highscore');
         const savedScores = localStorage.getItem('trex_scores');
+        const genAvgs = localStorage.getItem('trex_gen_avgs');
 
-        if (algo) this.algorithm = algo;
         if (highscore) this.highestScore = parseInt(highscore, 10);
         if (savedScores) this.scores = JSON.parse(savedScores);
-
-        // Load Q-learning properties
-        const qtable = localStorage.getItem('trex_qtable');
-        const episodes = localStorage.getItem('trex_episodes');
-        const epsilon = localStorage.getItem('trex_epsilon');
-
-        if (qtable) this.policy.importTable(qtable);
-        if (episodes) this.episodeCount = parseInt(episodes, 10);
-        if (epsilon) this.policy.epsilon = parseFloat(epsilon);
+        if (genAvgs) this.generationAverages = JSON.parse(genAvgs);
 
         // Load Genetic properties
         const gen = localStorage.getItem('trex_generation');
@@ -318,34 +207,30 @@ class AITrainer {
         if (gen) this.genetic.generation = parseInt(gen, 10);
         if (agentIdx) this.genetic.currentAgentIndex = parseInt(agentIdx, 10);
         if (popData) {
-            const list = JSON.parse(popData);
-            this.genetic.population = list.map(item => ({
-                brain: new NeuralNetwork(6, 6, 3,
-                    { w1: item.weights1, w2: item.weights2 },
-                    { b1: item.bias1, b2: item.bias2 }
-                ),
-                fitness: item.fitness
-            }));
-            this.genetic.populationSize = this.genetic.population.length;
+            try {
+                const list = JSON.parse(popData);
+                this.genetic.population = list.map(item => ({
+                    brain: new NeuralNetwork(6, 8, 3,
+                        { w1: item.weights1, w2: item.weights2, w3: item.weights3 },
+                        { b1: item.bias1, b2: item.bias2, b3: item.bias3 }
+                    ),
+                    fitness: item.fitness || 0
+                }));
+                this.genetic.populationSize = this.genetic.population.length;
+            } catch (e) {
+                console.warn("Could not load population, re-initializing", e);
+            }
         }
     }
 
     resetBrain() {
-        if (confirm('Are you sure you want to reset all AI progress?')) {
+        if (confirm('Deseja realmente reiniciar todo o progresso da Neuroevolução?')) {
             localStorage.clear();
 
-            // Re-instantiate policies
-            this.policy = new QLearningPolicy({
-                learningRate: 0.25,
-                discountFactor: 0.95,
-                epsilon: 0.5,
-                actions: ['NONE', 'JUMP', 'DUCK']
-            });
-            this.genetic = new GeneticEvolution(50, 0.15);
-
-            this.episodeCount = 0;
+            this.genetic = new GeneticEvolution(50, 0.10, 0.20);
             this.highestScore = 0;
             this.scores = [];
+            this.generationAverages = [];
             this.currentAgentFitness = 0;
             this.updateUI();
         }
@@ -371,8 +256,7 @@ class AITrainer {
         container.innerHTML = `
             <div><b>T-Rex AI Brain</b></div>
             <div>Status: <span id="ai-status-badge">INACTIVE</span></div>
-            <div>Algo: <span id="ui-algo-badge" style="font-weight: bold;">Q-LEARNING</span></div>
-            <div id="ui-mode-row">Mode: <span id="ui-mode-badge">TRAIN</span></div>
+            <div>Algo: <span id="ui-algo-badge" style="font-weight: bold; color: teal;">NEUROEVOLUTION</span></div>
             <hr/>
             <div id="ui-stats-container">
                 <!-- Dynamically populated stats -->
@@ -381,15 +265,12 @@ class AITrainer {
             <div id="ui-chart" style="line-height: 1.2; font-size: 11px;"></div>
             <hr/>
             <button id="btn-toggle-ai">Start</button>
-            <button id="btn-toggle-algo">Switch Algorithm</button>
-            <button id="btn-toggle-mode">Toggle Mode</button>
             <button id="btn-reset-ai">Reset</button>
             <button id="btn-save-ai">Export Best</button>
         `;
 
         document.body.appendChild(container);
 
-        // Bind events
         document.getElementById('btn-toggle-ai').addEventListener('click', () => {
             if (this.isTrainingActive) {
                 this.stop();
@@ -398,30 +279,11 @@ class AITrainer {
             }
         });
 
-        document.getElementById('btn-toggle-algo').addEventListener('click', () => {
-            this.stop();
-            this.algorithm = this.algorithm === 'q-learning' ? 'genetic' : 'q-learning';
-            this.saveProgress();
-            this.updateUI();
-        });
-
-        document.getElementById('btn-toggle-mode').addEventListener('click', () => {
-            this.isReplayMode = !this.isReplayMode;
-            this.updateUI();
-        });
-
         document.getElementById('btn-reset-ai').addEventListener('click', () => this.resetBrain());
 
         document.getElementById('btn-save-ai').addEventListener('click', () => {
-            let dataStr;
-            let filename;
-            if (this.algorithm === 'q-learning') {
-                dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(this.policy.exportTable());
-                filename = `qtable_ep_${this.episodeCount}.json`;
-            } else {
-                dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(this.genetic.exportBestBrain());
-                filename = `neuro_best_gen_${this.genetic.generation}.json`;
-            }
+            const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(this.genetic.exportBestBrain());
+            const filename = `neuro_best_gen_${this.genetic.generation}.json`;
             const downloadAnchor = document.createElement('a');
             downloadAnchor.setAttribute("href", dataStr);
             downloadAnchor.setAttribute("download", filename);
@@ -436,10 +298,6 @@ class AITrainer {
     updateUI() {
         const statusBadge = document.getElementById('ai-status-badge');
         const btnToggle = document.getElementById('btn-toggle-ai');
-        const algoBadge = document.getElementById('ui-algo-badge');
-        const modeBadge = document.getElementById('ui-mode-badge');
-        const btnToggleMode = document.getElementById('btn-toggle-mode');
-        const uiModeRow = document.getElementById('ui-mode-row');
         const statsContainer = document.getElementById('ui-stats-container');
 
         if (this.isTrainingActive) {
@@ -452,52 +310,20 @@ class AITrainer {
             btnToggle.innerText = 'Start';
         }
 
-        if (this.algorithm === 'q-learning') {
-            algoBadge.innerText = 'Q-LEARNING';
-            algoBadge.style.color = 'purple';
-            uiModeRow.style.display = 'block';
-            btnToggleMode.style.display = 'inline-block';
-
-            if (this.isReplayMode) {
-                modeBadge.innerText = 'REPLAY (Exploit)';
-                modeBadge.style.color = 'blue';
-                btnToggleMode.innerText = 'Switch to Train';
-            } else {
-                modeBadge.innerText = 'TRAIN (Exploring)';
-                modeBadge.style.color = 'darkorange';
-                btnToggleMode.innerText = 'Switch to Replay';
-            }
-
-            statsContainer.innerHTML = `
-                <div>Episodes: <span id="ui-episodes">${this.episodeCount}</span></div>
-                <div>Q-Table size: <span id="ui-states">${this.policy.getQTableSize()}</span></div>
-                <div>Epsilon: <span id="ui-epsilon">${(this.policy.epsilon * 100).toFixed(1)}%</span></div>
-                <div>High Score: <span id="ui-highscore">${this.highestScore}</span></div>
-                <div>Score: <span id="ui-current-score">0</span></div>
-            `;
-        } else {
-            algoBadge.innerText = 'NEUROEVOLUTION';
-            algoBadge.style.color = 'teal';
-            uiModeRow.style.display = 'none';
-            btnToggleMode.style.display = 'none';
-
-            statsContainer.innerHTML = `
-                <div>Generation: <span id="ui-generation">${this.genetic.generation}</span></div>
-                <div>Dino Index: <span id="ui-agent-idx">${this.genetic.currentAgentIndex + 1}/${this.genetic.populationSize}</span></div>
-                <div>Mutation: <span id="ui-mutation">${(this.genetic.mutationRate * 100).toFixed(0)}%</span></div>
-                <div>High Score: <span id="ui-highscore">${this.highestScore}</span></div>
-                <div>Score: <span id="ui-current-score">0</span></div>
-            `;
-        }
+        statsContainer.innerHTML = `
+            <div>Generation: <span id="ui-generation">${this.genetic.generation}</span></div>
+            <div>Dino Index: <span id="ui-agent-idx">${this.genetic.currentAgentIndex + 1}/${this.genetic.populationSize}</span></div>
+            <div>Mutation: <span id="ui-mutation">${(this.genetic.mutationRate * 100).toFixed(0)}%</span></div>
+            <div>High Score: <span id="ui-highscore">${this.highestScore}</span></div>
+            <div>Score: <span id="ui-current-score">0</span></div>
+        `;
 
         this.updateChart();
     }
 
     updateLiveStats(score) {
-        document.getElementById('ui-current-score').innerText = score;
-        if (this.algorithm === 'q-learning') {
-            document.getElementById('ui-states').innerText = this.policy.getQTableSize();
-        }
+        const scoreElem = document.getElementById('ui-current-score');
+        if (scoreElem) scoreElem.innerText = score;
     }
 
     updateChart() {
@@ -537,7 +363,6 @@ class AITrainer {
 
 // Automatically instantiate and attach to global scope
 document.addEventListener('DOMContentLoaded', () => {
-    // Wait for Chrome runner to load
     setTimeout(() => {
         window.aiTrainer = new AITrainer();
     }, 1000);
